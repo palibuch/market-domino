@@ -8,10 +8,10 @@ Market Domino is an experimental, auditable research engine for mapping market s
 - Point-in-time filtering and reproducible scenario propagation.
 - Explicit hypotheses and evidence references for graph edges.
 - Chronological walk-forward ML baseline with validation and modeled transaction costs.
-- One-step-ahead forecast diagnostics with a separate chronological residual-calibration segment and empirical uncertainty interval.
+- One-step-ahead forecast diagnostics with a separate chronological residual-calibration segment, empirical directional frequency, conformal-style uncertainty interval, and baseline error reporting.
 - UTC-aware timestamps and finite-value validation.
 
-**Important:** scenario impacts are not causal estimates. Forecast probabilities and intervals are empirical historical diagnostics, not guaranteed calibrated probabilities, price targets, investment advice, or promises of future performance. No market-data download or live trading integration is included.
+**Important:** scenario impacts are not causal estimates. Forecast frequencies and intervals are historical diagnostics, not guaranteed calibrated probabilities, price targets, investment advice, or promises of future performance. Financial time series may violate the assumptions behind nominal interval coverage. No market-data download or live trading integration is included.
 
 ## Quick start
 

@@ -1,13 +1,14 @@
 """Holdout-calibrated forecast intervals for historical research.
 
 This module makes one-step-ahead forecasts from close-only features. Its empirical
-probabilities are diagnostics from a chronological calibration holdout, not
-promises of calibrated future probabilities.
+direction frequency is a historical diagnostic, not a promise of calibrated
+future probabilities.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from math import ceil, isfinite
 from statistics import median
 from typing import Sequence
@@ -17,26 +18,29 @@ from .ml import PriceBar, SimpleLinearModel, features
 
 @dataclass(frozen=True)
 class Forecast:
-    as_of: object
+    as_of: datetime
     expected_return: float
     probability_up: float
     lower_90: float
     upper_90: float
     calibration_observations: int
     baseline_return: float
+    calibration_mae: float
+    baseline_calibration_mae: float
+    interval_method: str = "split-conformal absolute residual interval"
     disclaimer: str = (
         "Empirical holdout diagnostics only; not a calibrated probability, "
         "price target, trading signal, or investment advice."
     )
 
 
-def _quantile(values: Sequence[float], q: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * q
-    low = int(position)
-    high = min(low + 1, len(ordered) - 1)
-    fraction = position - low
-    return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
+def _conformal_radius(absolute_residuals: Sequence[float], coverage: float) -> float:
+    """Finite-sample split-conformal order statistic (exchangeability assumed)."""
+    if not absolute_residuals:
+        raise ValueError("at least one calibration residual is required")
+    ordered = sorted(absolute_residuals)
+    rank = min(len(ordered), ceil((len(ordered) + 1) * coverage))
+    return ordered[rank - 1]
 
 
 def forecast_next(
@@ -45,15 +49,17 @@ def forecast_next(
     calibration_fraction: float = 0.2,
     min_calibration_observations: int = 10,
 ) -> Forecast:
-    """Forecast the next close-to-close return using a chronological holdout.
+    """Forecast next close-to-close return using disjoint chronological data.
 
-    The linear model is trained on the earliest labeled observations. A later,
-    disjoint calibration segment supplies empirical residuals for the interval
-    and direction-frequency diagnostics. No calibration labels are used to fit
-    the model. The latest close is used only as the forecast feature row.
+    Earliest labels train the model; a later holdout is used only to estimate
+    absolute residuals and directional-frequency diagnostics. The latest close
+    supplies the forecast feature row, but its unknown next-close label is never
+    included in training or calibration.
     """
-    if not 0.1 <= calibration_fraction <= 0.5:
+    if not isfinite(calibration_fraction) or not 0.1 <= calibration_fraction <= 0.5:
         raise ValueError("calibration_fraction must be between 0.1 and 0.5")
+    if not isinstance(min_calibration_observations, int) or isinstance(min_calibration_observations, bool):
+        raise ValueError("min_calibration_observations must be an integer")
     if min_calibration_observations < 5:
         raise ValueError("min_calibration_observations must be at least 5")
     if len(bars) < 22:
@@ -63,41 +69,54 @@ def forecast_next(
 
     close = [bar.close for bar in bars]
     rows = features(close)
-    # Feature row j represents source close index j + 20. The last row has no
-    # known next-close label and must never enter fitting or calibration.
+    # Row j represents source close index j + 20. The final row has no known
+    # next-close target and is intentionally withheld from fitting/calibration.
     labeled_count = len(rows) - 1
-    calibration_count = max(min_calibration_observations, ceil(labeled_count * calibration_fraction))
+    calibration_count = max(
+        min_calibration_observations,
+        ceil(labeled_count * calibration_fraction),
+    )
     train_count = labeled_count - calibration_count
     if train_count < 10:
         raise ValueError("insufficient training data after reserving calibration observations")
 
-    targets: list[float] = []
-    for row_index in range(labeled_count):
-        source_index = row_index + 20
-        targets.append(close[source_index + 1] / close[source_index] - 1.0)
+    targets = [
+        close[row_index + 21] / close[row_index + 20] - 1.0
+        for row_index in range(labeled_count)
+    ]
+    train_targets = targets[:train_count]
+    model = SimpleLinearModel.fit(rows[:train_count], train_targets)
+    baseline = median(train_targets)
 
-    model = SimpleLinearModel.fit(rows[:train_count], targets[:train_count])
-    baseline = median(targets[:train_count])
-
-    def ensemble(row: Sequence[float]) -> float:
-        # Shrink an unstable small-sample fit toward the training-only median.
+    def estimate(row: Sequence[float]) -> float:
+        # A modest shrinkage toward a robust training-only baseline limits
+        # overreaction from the intentionally small diagonal linear model.
         return 0.75 * model.predict(row) + 0.25 * baseline
 
-    residuals = [
-        actual - ensemble(row)
-        for row, actual in zip(rows[train_count:labeled_count], targets[train_count:labeled_count])
+    calibration_predictions = [
+        estimate(row) for row in rows[train_count:labeled_count]
     ]
+    calibration_targets = targets[train_count:labeled_count]
+    residuals = [actual - predicted for actual, predicted in zip(
+        calibration_targets, calibration_predictions
+    )]
     if len(residuals) < min_calibration_observations:
         raise ValueError("not enough chronological calibration observations")
 
-    point = ensemble(rows[-1])
+    point = estimate(rows[-1])
     probability_up = sum(point + residual > 0 for residual in residuals) / len(residuals)
+    radius = _conformal_radius([abs(residual) for residual in residuals], 0.9)
+    calibration_mae = sum(abs(residual) for residual in residuals) / len(residuals)
+    baseline_mae = sum(abs(actual - baseline) for actual in calibration_targets) / len(residuals)
+
     return Forecast(
         as_of=bars[-1].timestamp,
         expected_return=point,
         probability_up=probability_up,
-        lower_90=point + _quantile(residuals, 0.05),
-        upper_90=point + _quantile(residuals, 0.95),
+        lower_90=point - radius,
+        upper_90=point + radius,
         calibration_observations=len(residuals),
         baseline_return=baseline,
+        calibration_mae=calibration_mae,
+        baseline_calibration_mae=baseline_mae,
     )
