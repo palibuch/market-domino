@@ -17,7 +17,7 @@ class PriceBar:
     def __post_init__(self) -> None:
         if not isfinite(self.close) or self.close <= 0:
             raise ValueError("close must be a finite positive number")
-        if self.timestamp.tzinfo is None:
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise ValueError("timestamp must be timezone-aware")
 
 
@@ -28,6 +28,7 @@ class WalkForwardMetrics:
     annualized_sharpe: float
     maximum_drawdown: float
     accuracy: float
+    total_cost: float = 0.0
 
 
 def chronological_splits(
@@ -35,7 +36,7 @@ def chronological_splits(
     train_size: int,
     test_size: int,
 ) -> Iterable[tuple[range, range]]:
-    """Generate adjacent walk-forward windows without reusing future observations."""
+    """Generate expanding chronological windows with disjoint sample indices."""
     if length < 1:
         raise ValueError("length must be positive")
     if train_size < 2 or test_size < 1:
@@ -65,43 +66,44 @@ def rolling_mean(values: Sequence[float], window: int) -> list[float | None]:
 
 
 def features(close: Sequence[float]) -> list[list[float]]:
-    """Create small, interpretable features and prevent forward leakage.
+    """Build interpretable, close-time features; no feature uses a future close.
 
-    Each feature row uses information available at that close only.
+    Rows correspond to source close indices 20 onward. Callers must preserve this
+    documented offset when aligning rows with labels.
     """
-    returns: list[float] = [0.0] * len(close)
+    if any(not isfinite(value) or value <= 0 for value in close):
+        raise ValueError("close values must be finite and positive")
+    if len(close) < 21:
+        return []
+
+    returns = [0.0] * len(close)
     for index in range(1, len(close)):
         returns[index] = close[index] / close[index - 1] - 1.0
 
-    momentum_5 = rolling_mean(close, 5)
-    volatility_10 = [None] * len(close)
+    means_5 = rolling_mean(close, 5)
+    means_20 = rolling_mean(close, 20)
+    volatility_10: list[float | None] = [None] * len(close)
     for index in range(9, len(close)):
-        sample = returns[index - 9:index + 1]
-        volatility_10[index] = pstdev(sample) if len(sample) > 1 else 0.0
+        volatility_10[index] = pstdev(returns[index - 9:index + 1])
 
-    result: list[list[float]] = []
-    for index in range(len(close)):
-        if index < 20:
-            continue
-        mean_5 = momentum_5[index]
-        if mean_5 is None:
-            continue
-        ma_5 = mean_5
-        ma_20 = rolling_mean(close, 20)[index]
-        if ma_20 is None:
-            continue
-        result.append([
+    rows: list[list[float]] = []
+    for index in range(20, len(close)):
+        mean_5 = means_5[index]
+        mean_20 = means_20[index]
+        vol = volatility_10[index]
+        assert mean_5 is not None and mean_20 is not None and vol is not None
+        rows.append([
             returns[index],
-            close[index] / ma_5 - 1.0,
-            close[index] / ma_20 - 1.0,
-            volatility_10[index] or 0.0,
+            close[index] / mean_5 - 1.0,
+            close[index] / mean_20 - 1.0,
+            vol,
         ])
-    return result
+    return rows
 
 
 @dataclass(frozen=True)
 class SimpleLinearModel:
-    """A deterministic ridge-like model implemented without third-party ML dependencies."""
+    """A deterministic diagonal ridge regression baseline."""
 
     weights: tuple[float, ...]
     bias: float
@@ -111,8 +113,12 @@ class SimpleLinearModel:
         if len(rows) != len(targets) or not rows:
             raise ValueError("training rows and targets must have equal, non-zero lengths")
         width = len(rows[0])
-        if any(len(row) != width for row in rows):
-            raise ValueError("all feature rows must have equal width")
+        if width == 0 or any(len(row) != width for row in rows):
+            raise ValueError("all feature rows must have the same non-zero width")
+        if any(not isfinite(value) for row in rows for value in row):
+            raise ValueError("features must be finite")
+        if any(not isfinite(target) for target in targets):
+            raise ValueError("targets must be finite")
 
         means = [sum(row[column] for row in rows) / len(rows) for column in range(width)]
         target_mean = sum(targets) / len(targets)
@@ -132,7 +138,12 @@ class SimpleLinearModel:
     def predict(self, row: Sequence[float]) -> float:
         if len(row) != len(self.weights):
             raise ValueError("feature width does not match model")
-        return self.bias + sum(weight * value for weight, value in zip(self.weights, row))
+        if any(not isfinite(value) for value in row):
+            raise ValueError("features must be finite")
+        prediction = self.bias + sum(weight * value for weight, value in zip(self.weights, row))
+        if not isfinite(prediction):
+            raise ValueError("prediction is not finite")
+        return prediction
 
 
 def evaluate_model(
@@ -140,8 +151,29 @@ def evaluate_model(
     train: range,
     test: range,
     threshold: float = 0.001,
+    cost_bps: float = 0.0,
 ) -> tuple[SimpleLinearModel, WalkForwardMetrics]:
-    """Chronological model test using next-bar close-to-close target."""
+    """Evaluate next-bar returns on a chronological holdout.
+
+    Indices refer to the close whose feature is used to predict its next close.
+    A cost is charged for each unit of position turnover, including initial entry.
+    Metrics assume one observation per trading session for Sharpe annualization.
+    """
+    if not isfinite(threshold) or threshold < 0:
+        raise ValueError("threshold must be finite and non-negative")
+    if not isfinite(cost_bps) or cost_bps < 0:
+        raise ValueError("cost_bps must be finite and non-negative")
+    if not train or not test:
+        raise ValueError("train and test ranges must not be empty")
+    if train.step <= 0 or test.step <= 0:
+        raise ValueError("train and test ranges must move forward")
+    if train.start < 0 or test.start < 0 or train.stop > len(bars) or test.stop > len(bars):
+        raise ValueError("train/test indices exceed available bars")
+    if train.stop > test.start:
+        raise ValueError("training and test indices must be disjoint and chronological")
+    if any(left.timestamp >= right.timestamp for left, right in zip(bars, bars[1:])):
+        raise ValueError("bars must have strictly increasing timestamps")
+
     close = [bar.close for bar in bars]
     all_features = features(close)
     offset = 20
@@ -161,6 +193,8 @@ def evaluate_model(
     model = SimpleLinearModel.fit(train_rows, train_targets)
     strategy_returns: list[float] = []
     correct = 0
+    total_cost = 0.0
+    previous_position = 0.0
 
     for index in test:
         feature_index = index - offset
@@ -169,11 +203,14 @@ def evaluate_model(
         prediction = model.predict(all_features[feature_index])
         position = 1.0 if prediction > threshold else (-1.0 if prediction < -threshold else 0.0)
         actual = close[index + 1] / close[index] - 1.0
-        strategy_returns.append(position * actual)
+        cost = abs(position - previous_position) * cost_bps / 10_000.0
+        strategy_returns.append(position * actual - cost)
+        total_cost += cost
+        previous_position = position
         correct += int((prediction >= 0) == (actual >= 0))
 
     if not strategy_returns:
-        return model, WalkForwardMetrics(0, 0.0, 0.0, 0.0, 0.0)
+        return model, WalkForwardMetrics(0, 0.0, 0.0, 0.0, 0.0, total_cost)
 
     mean = sum(strategy_returns) / len(strategy_returns)
     deviation = pstdev(strategy_returns) if len(strategy_returns) > 1 else 0.0
@@ -193,4 +230,5 @@ def evaluate_model(
         annualized_sharpe=sharpe,
         maximum_drawdown=max_drawdown,
         accuracy=correct / len(strategy_returns),
+        total_cost=total_cost,
     )
