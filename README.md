@@ -5,14 +5,13 @@ Market Domino is an experimental, auditable research engine for mapping market s
 ## Current foundation
 
 - A typed, versioned directed acyclic graph (DAG) for events, indicators, sectors, assets, and risks.
-- Point-in-time filtering: scenario runs only use nodes and edges available at the requested timestamp.
-- Edges must reference explicit hypotheses; draft/rejected edges are excluded from default propagation.
-- Reproducible Monte Carlo scenario propagation with a fixed seed and bounded path expansion.
-- Reports include impact intervals, directional shares, representative paths, evidence IDs, and a stable run ID.
-- A small ML research baseline with chronological walk-forward evaluation, finite-data validation, and optional turnover costs.
-- UTC-aware timestamps are required to reduce time-zone ambiguity.
+- Point-in-time filtering and reproducible scenario propagation.
+- Explicit hypotheses and evidence references for graph edges.
+- Chronological walk-forward ML baseline with validation and modeled transaction costs.
+- One-step-ahead forecast diagnostics with a separate chronological residual-calibration segment and empirical uncertainty interval.
+- UTC-aware timestamps and finite-value validation.
 
-**Important:** impact scores are normalized scenario scores, not estimated causal effects, price forecasts, probabilities of profit, or investment advice. A graph edge is a research hypothesis, not proof of causality. Causal interpretation requires an identification strategy, controls for confounding, and out-of-sample validation.
+**Important:** scenario impacts are not causal estimates. Forecast probabilities and intervals are empirical historical diagnostics, not guaranteed calibrated probabilities, price targets, investment advice, or promises of future performance. No market-data download or live trading integration is included.
 
 ## Quick start
 
@@ -23,6 +22,4 @@ python -m pip install -e ".[dev]"
 python -m pytest
 ```
 
-The core engine uses only the Python standard library. Tests use pytest-compatible `unittest` cases.
-
-See [the machine-learning guide](docs/machine-learning.md) and [architecture notes](docs/architecture.md).
+See [forecasting notes](docs/forecasting.md), [machine-learning guide](docs/machine-learning.md), and [architecture notes](docs/architecture.md).
